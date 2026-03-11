@@ -1,6 +1,6 @@
 # 🤖 AI Job Application Agent
 
-An intelligent, multi-platform job application agent that parses your resume, finds matching jobs, scores them with AI, and auto-applies on LinkedIn and Naukri — built by **Susmit Roy**.
+An intelligent, multi-platform job application agent that parses your resume, finds matching jobs, scores them with AI, and auto-applies on LinkedIn and Naukri built by **Susmit Roy**.
 
 ---
 
