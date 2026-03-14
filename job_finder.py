@@ -1,176 +1,267 @@
 """
-job_finder.py
-Discovers active job listings from LinkedIn, Naukri, Indeed, and others
-using the JSearch API (RapidAPI), based on the user's parsed profile.
+run_agent.py
+🤖 hunt-smart — AI Job Application Agent
+Orchestrates: Resume Parsing → Job Discovery → AI Matching → Auto Apply → Tracking
+
+Usage:
+    python run_agent.py                  # Full pipeline
+    python run_agent.py --parse-only     # Only parse resume
+    python run_agent.py --find-only      # Only discover jobs
+    python run_agent.py --match-only     # Only score jobs
+    python run_agent.py --apply-only     # Only apply (uses saved apply_list.json)
+    python run_agent.py --dashboard      # Launch tracker dashboard
 """
 
-import requests
-import json
-import time
+import sys
 import os
-from datetime import datetime
+import json
+import argparse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ── Config ────────────────────────────────────────────────────────────────────
+try:
+    from config.secrets import (
+        NVIDIA_API_KEY,
+        JSEARCH_API_KEY,
+        LINKEDIN_EMAIL, LINKEDIN_PASSWORD,
+        NAUKRI_EMAIL,   NAUKRI_PASSWORD
+    )
+    from config.search  import SEARCH_CONFIG
+    from config.answers import ANSWERS_CONFIG
+except ImportError as e:
+    print(f"❌ Config error: {e}")
+    print("   Please fill in your config/secrets.py before running.")
+    sys.exit(1)
+
+# ── Modules ───────────────────────────────────────────────────────────────────
+from modules.resume_parser  import parse_resume, load_profile
+from modules.job_finder     import discover_jobs, save_jobs
+from modules.job_matcher    import batch_score_jobs, print_apply_list
+from modules.linkedin_applier import run_linkedin_applier
+from modules.naukri_applier   import run_naukri_applier
+from modules.tracker        import log_bulk_applications, run_dashboard, get_stats
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+RESUME_PATH    = "resumes/resume.pdf"
+PROFILE_PATH   = "data/profile.json"
+DISCOVERED_PATH= "data/discovered_jobs.json"
+APPLY_LIST_PATH= "data/apply_list.json"
+SKIP_LIST_PATH = "data/skip_list.json"
 
 
-def build_search_queries(profile: dict, config: dict) -> list[str]:
-    '''
-    Generates smart search queries from the user's profile and search config.
-    Returns a list of query strings to run through JSearch.
-    '''
-    target_roles = profile.get("target_roles", [])
-    current_title = profile.get("current_title", "")
-    job_titles = profile.get("job_titles", [])
-
-    # Pull from config overrides or fall back to profile
-    roles_to_search = config.get("search_roles") or (target_roles + [current_title])[:5]
-    locations = config.get("search_locations", ["India", "Remote"])
-
-    queries = []
-    for role in roles_to_search:
-        for location in locations:
-            queries.append(f"{role} {location}")
-
-    # Deduplicate
-    return list(dict.fromkeys(queries))
+def banner() -> None:
+    print("""
+╔══════════════════════════════════════════════════════════════╗
+║          🤖  hunt-smart — AI Job Application Agent          ║
+║          Model: NVIDIA NIM — Nemotron 49B                   ║
+║          Built by Susmit Roy (Rukai)                        ║
+╚══════════════════════════════════════════════════════════════╝
+    """)
 
 
-def fetch_jobs(query: str, jsearch_api_key: str, num_pages: int = 1,
-               date_posted: str = "week") -> list[dict]:
-    '''
-    Fetches job listings from JSearch API for a given query.
-    date_posted options: "today", "3days", "week", "month"
-    Returns a list of raw job dicts.
-    '''
-    url = "https://jsearch.p.rapidapi.com/search"
-    headers = {
-        "X-RapidAPI-Key": jsearch_api_key,
-        "X-RapidAPI-Host": "jsearch.p.rapidapi.com"
+def check_secrets() -> bool:
+    missing = []
+    if "nvapi-your" in NVIDIA_API_KEY or not NVIDIA_API_KEY:
+        missing.append("NVIDIA_API_KEY")
+    if "your_" in JSEARCH_API_KEY or not JSEARCH_API_KEY:
+        missing.append("JSEARCH_API_KEY")
+    if missing:
+        print(f"❌ Missing required secrets: {', '.join(missing)}")
+        print("   Please fill in config/secrets.py")
+        return False
+    return True
+
+
+# ── Steps ─────────────────────────────────────────────────────────────────────
+
+def step_parse_resume() -> dict:
+    print("\n" + "─" * 60)
+    print("📄 STEP 1: RESUME PARSING  [NVIDIA NIM — Nemotron 49B]")
+    print("─" * 60)
+
+    if os.path.exists(PROFILE_PATH):
+        print(f"   Found existing profile at {PROFILE_PATH}")
+        choice = input("   Re-parse resume? (y/n, default n): ").strip().lower()
+        if choice != "y":
+            profile = load_profile(PROFILE_PATH)
+            print(f"   ✅ Loaded: {profile.get('name')} — {profile.get('current_title')}")
+            return profile
+
+    profile = parse_resume(RESUME_PATH, NVIDIA_API_KEY, PROFILE_PATH)
+    print(f"\n   ✅ Parsed : {profile.get('name')} | {profile.get('current_title')}")
+    print(f"   Experience: {profile.get('years_of_experience')} years")
+    print(f"   Roles     : {', '.join(profile.get('target_roles', [])[:3])}")
+    return profile
+
+
+def step_discover_jobs(profile: dict) -> list:
+    print("\n" + "─" * 60)
+    print("🔍 STEP 2: JOB DISCOVERY  [JSearch API — RapidAPI]")
+    print("─" * 60)
+
+    if os.path.exists(DISCOVERED_PATH):
+        with open(DISCOVERED_PATH, encoding="utf-8") as f:
+            existing = json.load(f)
+        print(f"   Found {len(existing)} previously discovered jobs")
+        choice = input("   Re-fetch jobs? (y/n, default n): ").strip().lower()
+        if choice != "y":
+            return existing
+
+    if "your_" in JSEARCH_API_KEY:
+        print("   ⚠️  JSearch API key not set — skipping job discovery")
+        return []
+
+    jobs = discover_jobs(profile, SEARCH_CONFIG, JSEARCH_API_KEY)
+    save_jobs(jobs, DISCOVERED_PATH)
+    return jobs
+
+
+def step_match_jobs(jobs: list, profile: dict) -> list:
+    print("\n" + "─" * 60)
+    print("🤖 STEP 3: AI JOB MATCHING  [NVIDIA NIM — Nemotron 49B]")
+    print("─" * 60)
+
+    if os.path.exists(APPLY_LIST_PATH):
+        with open(APPLY_LIST_PATH, encoding="utf-8") as f:
+            existing = json.load(f)
+        print(f"   Found existing apply list ({len(existing)} jobs)")
+        choice = input("   Re-score jobs? (y/n, default n): ").strip().lower()
+        if choice != "y":
+            print_apply_list(existing[:10])
+            return existing
+
+    if not jobs:
+        print("   ⚠️  No jobs to score")
+        return []
+
+    min_score = SEARCH_CONFIG.get("min_match_score", 55)
+    apply_list, skip_list = batch_score_jobs(
+        jobs, profile, NVIDIA_API_KEY, min_score
+    )
+
+    with open(APPLY_LIST_PATH, "w") as f:
+        json.dump(apply_list, f, indent=2)
+    with open(SKIP_LIST_PATH, "w") as f:
+        json.dump(skip_list, f, indent=2)
+
+    print_apply_list(apply_list[:10])
+    return apply_list
+
+
+def step_apply(apply_list: list, profile: dict) -> None:
+    print("\n" + "─" * 60)
+    print("🚀 STEP 4: AUTO APPLY  [Selenium + undetected-chromedriver]")
+    print("─" * 60)
+
+    if not apply_list:
+        print("   ⚠️  No jobs in apply list")
+        return
+
+    print(f"\n   Apply list contains {len(apply_list)} jobs")
+    print("   Platforms: LinkedIn Easy Apply + Naukri")
+
+    secrets = {
+        "LINKEDIN_EMAIL":    LINKEDIN_EMAIL,
+        "LINKEDIN_PASSWORD": LINKEDIN_PASSWORD,
+        "NAUKRI_EMAIL":      NAUKRI_EMAIL,
+        "NAUKRI_PASSWORD":   NAUKRI_PASSWORD,
     }
 
-    all_jobs = []
+    choice = input("\n   Proceed with auto-apply? (y/n): ").strip().lower()
+    if choice != "y":
+        print("   Skipped.")
+        return
 
-    for page in range(1, num_pages + 1):
-        params = {
-            "query": query,
-            "page": str(page),
-            "num_pages": "1",
-            "date_posted": date_posted,
-            "remote_jobs_only": "false",
-            "employment_types": "FULLTIME,PARTTIME,CONTRACTOR"
-        }
+    # LinkedIn
+    print("\n  🔗 Starting LinkedIn Easy Apply...")
+    apply_list = run_linkedin_applier(
+        apply_list=apply_list,
+        profile=profile,
+        answers_config=ANSWERS_CONFIG,
+        secrets=secrets,
+        resume_path=RESUME_PATH,
+        max_applications=SEARCH_CONFIG.get("max_linkedin_applications", 20),
+        pause_before_submit=SEARCH_CONFIG.get("pause_before_submit", False)
+    )
 
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json()
-            jobs = data.get("data", [])
-            all_jobs.extend(jobs)
-            print(f"  📦 Page {page}: {len(jobs)} jobs for '{query}'")
-            time.sleep(0.5)  # be polite to the API
+    # Naukri
+    print("\n  🏢 Starting Naukri Apply...")
+    naukri_apps = run_naukri_applier(
+        profile=profile,
+        search_config=SEARCH_CONFIG,
+        secrets=secrets,
+        resume_path=RESUME_PATH,
+        max_applications=SEARCH_CONFIG.get("max_naukri_applications", 15),
+        pause_before_apply=SEARCH_CONFIG.get("pause_before_submit", False)
+    )
 
-        except requests.exceptions.RequestException as e:
-            print(f"  ⚠️  API error for '{query}' page {page}: {e}")
-            break
-
-    return all_jobs
-
-
-def normalize_job(raw_job: dict) -> dict:
-    '''
-    Normalizes a raw JSearch job dict into a clean standard format.
-    '''
-    return {
-        "job_id": raw_job.get("job_id", ""),
-        "title": raw_job.get("job_title", ""),
-        "company": raw_job.get("employer_name", ""),
-        "location": f"{raw_job.get('job_city', '')} {raw_job.get('job_country', '')}".strip(),
-        "is_remote": raw_job.get("job_is_remote", False),
-        "employment_type": raw_job.get("job_employment_type", ""),
-        "description": raw_job.get("job_description", "")[:3000],  # trim for AI
-        "apply_link": raw_job.get("job_apply_link", ""),
-        "apply_is_direct": raw_job.get("job_apply_is_direct", False),
-        "source": raw_job.get("job_publisher", ""),
-        "posted_at": raw_job.get("job_posted_at_datetime_utc", ""),
-        "salary_min": raw_job.get("job_min_salary"),
-        "salary_max": raw_job.get("job_max_salary"),
-        "salary_currency": raw_job.get("job_salary_currency", ""),
-        "required_experience": raw_job.get("job_required_experience", {}).get("required_experience_in_months"),
-        "required_skills": raw_job.get("job_required_skills") or [],
-        "highlights": raw_job.get("job_highlights", {}),
-        "employer_logo": raw_job.get("employer_logo", ""),
-        "match_score": None,  # filled by matcher
-        "status": "discovered",
-        "discovered_at": datetime.now().isoformat()
+    # Enrich Naukri apps with match scores from apply_list where possible
+    apply_lookup = {
+        (j.get("title","").lower(), j.get("company","").lower()): j
+        for j in apply_list
     }
+    for app in naukri_apps:
+        key = (app.get("title","").lower(), app.get("company","").lower())
+        if key in apply_lookup:
+            app["match_score"]  = apply_lookup[key].get("match_score")
+            app["match_reason"] = apply_lookup[key].get("match_reason","")
+
+    # Log to tracker
+    print("\n  📊 Logging applications to tracker...")
+    li_count  = log_bulk_applications(apply_list)
+    nk_count  = log_bulk_applications(naukri_apps)
+    print(f"\n  ✅ Logged: {li_count} LinkedIn + {nk_count} Naukri applications")
+    print(f"\n  📈 Total in database: {get_stats().get('total', 0)}")
 
 
-def deduplicate_jobs(jobs: list[dict]) -> list[dict]:
-    '''
-    Removes duplicate jobs by job_id and by (title + company) pair.
-    '''
-    seen_ids = set()
-    seen_pairs = set()
-    unique = []
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-    for job in jobs:
-        jid = job.get("job_id")
-        pair = (job.get("title", "").lower(), job.get("company", "").lower())
+def main() -> None:
+    parser = argparse.ArgumentParser(description="hunt-smart — AI Job Application Agent")
+    parser.add_argument("--parse-only",  action="store_true")
+    parser.add_argument("--find-only",   action="store_true")
+    parser.add_argument("--match-only",  action="store_true")
+    parser.add_argument("--apply-only",  action="store_true")
+    parser.add_argument("--dashboard",   action="store_true")
+    args = parser.parse_args()
 
-        if jid and jid in seen_ids:
-            continue
-        if pair in seen_pairs:
-            continue
+    banner()
 
-        seen_ids.add(jid)
-        seen_pairs.add(pair)
-        unique.append(job)
+    if args.dashboard:
+        run_dashboard()
+        return
 
-    return unique
+    if not check_secrets():
+        return
 
+    if args.parse_only:
+        step_parse_resume()
+        return
 
-def discover_jobs(profile: dict, config: dict, jsearch_api_key: str) -> list[dict]:
-    '''
-    Full job discovery pipeline using the user's profile and search config.
-    Returns a deduplicated list of normalized job dicts.
-    '''
-    queries = build_search_queries(profile, config)
-    print(f"\n🔍 Running {len(queries)} search queries...")
+    profile = step_parse_resume()
 
-    all_raw_jobs = []
-    for query in queries:
-        print(f"\n  🔎 Searching: {query}")
-        raw = fetch_jobs(
-            query=query,
-            jsearch_api_key=jsearch_api_key,
-            num_pages=config.get("pages_per_query", 1),
-            date_posted=config.get("date_posted", "week")
-        )
-        all_raw_jobs.extend(raw)
+    if args.find_only:
+        step_discover_jobs(profile)
+        return
 
-    print(f"\n📥 Total raw jobs fetched: {len(all_raw_jobs)}")
+    jobs = step_discover_jobs(profile)
 
-    normalized = [normalize_job(j) for j in all_raw_jobs]
-    unique = deduplicate_jobs(normalized)
+    if args.match_only:
+        if not jobs and os.path.exists(DISCOVERED_PATH):
+            with open(DISCOVERED_PATH, encoding="utf-8") as f:
+                jobs = json.load(f)
+        step_match_jobs(jobs, profile)
+        return
 
-    print(f"✅ After deduplication: {len(unique)} unique jobs")
-    return unique
+    apply_list = step_match_jobs(jobs, profile)
+    step_apply(apply_list, profile)
 
-
-def save_jobs(jobs: list[dict], output_path: str) -> None:
-    '''
-    Saves the jobs list as a JSON file.
-    '''
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(jobs, f, indent=2, ensure_ascii=False)
-    print(f"💾 Saved {len(jobs)} jobs to: {output_path}")
+    print("\n" + "═" * 60)
+    print("🎉 AGENT RUN COMPLETE")
+    print("   Run `python run_agent.py --dashboard` to view tracker")
+    print("═" * 60 + "\n")
 
 
 if __name__ == "__main__":
-    import sys
-    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from config.secrets import JSEARCH_API_KEY
-    from config.search import SEARCH_CONFIG
-    from modules.resume_parser import load_profile
-
-    profile = load_profile("data/profile.json")
-    jobs = discover_jobs(profile, SEARCH_CONFIG, JSEARCH_API_KEY)
-    save_jobs(jobs, "data/discovered_jobs.json")
+    main()
